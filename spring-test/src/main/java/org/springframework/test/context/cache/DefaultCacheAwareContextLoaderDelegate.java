@@ -17,6 +17,7 @@
 package org.springframework.test.context.cache;
 
 import java.util.List;
+import java.util.concurrent.ExecutionException;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -125,83 +126,80 @@ public class DefaultCacheAwareContextLoaderDelegate implements CacheAwareContext
 	@Override
 	public boolean isContextLoaded(MergedContextConfiguration mergedConfig) {
 		mergedConfig = replaceIfNecessary(mergedConfig);
-		synchronized (this.contextCache) {
-			return this.contextCache.contains(mergedConfig);
-		}
+		return this.contextCache.contains(mergedConfig);
 	}
 
 	@Override
 	public ApplicationContext loadContext(MergedContextConfiguration mergedConfig) {
 		mergedConfig = replaceIfNecessary(mergedConfig);
-		synchronized (this.contextCache) {
-			ApplicationContext context = this.contextCache.get(mergedConfig);
-			try {
-				if (context == null) {
-					int failureCount = this.contextCache.getFailureCount(mergedConfig);
-					if (failureCount >= this.failureThreshold) {
-						throw new IllegalStateException("""
-								ApplicationContext failure threshold (%d) exceeded: \
-								skipping repeated attempt to load context for %s"""
-									.formatted(this.failureThreshold, mergedConfig));
-					}
-					try {
-						if (mergedConfig instanceof AotMergedContextConfiguration aotMergedConfig) {
-							context = loadContextInAotMode(aotMergedConfig);
-						}
-						else {
-							context = loadContextInternal(mergedConfig);
-						}
-						if (logger.isTraceEnabled()) {
-							logger.trace("Storing ApplicationContext [%s] in cache under key %s".formatted(
-									System.identityHashCode(context), mergedConfig));
-						}
-						this.contextCache.put(mergedConfig, context);
-					}
-					catch (Exception ex) {
-						if (logger.isTraceEnabled()) {
-							logger.trace("Incrementing ApplicationContext failure count for " + mergedConfig);
-						}
-						this.contextCache.incrementFailureCount(mergedConfig);
-						Throwable cause = ex;
-						if (ex instanceof ContextLoadException cle) {
-							cause = cle.getCause();
-							for (ApplicationContextFailureProcessor contextFailureProcessor : this.contextFailureProcessors) {
-								try {
-									contextFailureProcessor.processLoadFailure(cle.getApplicationContext(), cause);
+
+		var contextLoader = this.contextCache.computeIfAbsent(mergedConfig, k -> {
+							ApplicationContext contextToReturn;
+							int failureCount = this.contextCache.getFailureCount(k);
+							if (failureCount >= this.failureThreshold) {
+								throw new IllegalStateException("""
+										ApplicationContext failure threshold (%d) exceeded: \
+										skipping repeated attempt to load context for %s"""
+										.formatted(this.failureThreshold, k));
+							}
+							try {
+								if (k instanceof AotMergedContextConfiguration aotMergedConfig) {
+									contextToReturn = loadContextInAotMode(aotMergedConfig);
+								} else {
+									contextToReturn = loadContextInternal(k);
 								}
-								catch (Throwable throwable) {
-									if (logger.isDebugEnabled()) {
-										logger.debug("Ignoring exception thrown from ApplicationContextFailureProcessor [%s]: %s"
-												.formatted(contextFailureProcessor, throwable));
+								if (logger.isTraceEnabled()) {
+									logger.trace("Storing ApplicationContext [%s] in cache under key %s".formatted(
+											System.identityHashCode(contextToReturn), k));
+								}
+								return contextToReturn;
+							} catch (Exception ex) {
+								if (logger.isTraceEnabled()) {
+									logger.trace("Incrementing ApplicationContext failure count for " + k);
+								}
+								this.contextCache.incrementFailureCount(k);
+								Throwable cause = ex;
+								if (ex instanceof ContextLoadException cle) {
+									cause = cle.getCause();
+									for (ApplicationContextFailureProcessor contextFailureProcessor : this.contextFailureProcessors) {
+										try {
+											contextFailureProcessor.processLoadFailure(cle.getApplicationContext(), cause);
+										} catch (Throwable throwable) {
+											if (logger.isDebugEnabled()) {
+												logger.debug("Ignoring exception thrown from ApplicationContextFailureProcessor [%s]: %s"
+														.formatted(contextFailureProcessor, throwable));
+											}
+										}
 									}
 								}
+								throw new IllegalStateException(
+										"Failed to load ApplicationContext for " + k, cause);
 							}
-						}
-						throw new IllegalStateException(
-								"Failed to load ApplicationContext for " + mergedConfig, cause);
-					}
-				}
-				else {
-					if (logger.isTraceEnabled()) {
-						logger.trace("Retrieved ApplicationContext [%s] from cache with key %s".formatted(
-								System.identityHashCode(context), mergedConfig));
-					}
-				}
-			}
-			finally {
-				this.contextCache.logStatistics();
-			}
+						});
 
+		try {
+			var context = contextLoader.get();
+			if (context == null) {
+			} else {
+				if (logger.isTraceEnabled()) {
+					logger.trace("Retrieved ApplicationContext [%s] from cache with key %s".formatted(
+							System.identityHashCode(context), mergedConfig));
+				}
+			}
 			return context;
+		} catch (InterruptedException e) {
+			throw new RuntimeException(e);
+		} catch (ExecutionException e) {
+			throw new RuntimeException(e);
+		} finally {
+			this.contextCache.logStatistics();
 		}
 	}
 
 	@Override
 	public void closeContext(MergedContextConfiguration mergedConfig, @Nullable HierarchyMode hierarchyMode) {
 		mergedConfig = replaceIfNecessary(mergedConfig);
-		synchronized (this.contextCache) {
-			this.contextCache.remove(mergedConfig, hierarchyMode);
-		}
+		this.contextCache.remove(mergedConfig, hierarchyMode);
 	}
 
 	/**
@@ -223,8 +221,7 @@ public class DefaultCacheAwareContextLoaderDelegate implements CacheAwareContext
 		ContextLoader contextLoader = getContextLoader(mergedConfig);
 		if (contextLoader instanceof SmartContextLoader smartContextLoader) {
 			return smartContextLoader.loadContext(mergedConfig);
-		}
-		else {
+		} else {
 			String[] locations = mergedConfig.getLocations();
 			Assert.notNull(locations, () -> """
 					Cannot load an ApplicationContext with a NULL 'locations' array. \
@@ -245,8 +242,7 @@ public class DefaultCacheAwareContextLoaderDelegate implements CacheAwareContext
 
 		if (logger.isTraceEnabled()) {
 			logger.trace("Loading ApplicationContext for AOT runtime for " + aotMergedConfig.getOriginal());
-		}
-		else if (logger.isDebugEnabled()) {
+		} else if (logger.isDebugEnabled()) {
 			logger.debug("Loading ApplicationContext for AOT runtime for test class " +
 					aotMergedConfig.getTestClass().getName());
 		}
@@ -258,7 +254,7 @@ public class DefaultCacheAwareContextLoaderDelegate implements CacheAwareContext
 					Cannot load ApplicationContext for AOT runtime for %s. The configured \
 					ContextLoader [%s] must be an AotContextLoader and must create a \
 					GenericApplicationContext."""
-						.formatted(aotMergedConfig.getOriginal(), contextLoader.getClass().getName()));
+					.formatted(aotMergedConfig.getOriginal(), contextLoader.getClass().getName()));
 		}
 		gac.registerShutdownHook();
 		return gac;
@@ -284,7 +280,7 @@ public class DefaultCacheAwareContextLoaderDelegate implements CacheAwareContext
 	 * @param mergedConfig the original {@code MergedContextConfiguration}
 	 * @return {@code AotMergedContextConfiguration} or the original {@code MergedContextConfiguration}
 	 * @throws IllegalStateException if running in AOT mode and the test class does not
-	 * have an AOT-optimized {@code ApplicationContext}
+	 *                               have an AOT-optimized {@code ApplicationContext}
 	 * @since 6.0
 	 */
 	private MergedContextConfiguration replaceIfNecessary(MergedContextConfiguration mergedConfig) {

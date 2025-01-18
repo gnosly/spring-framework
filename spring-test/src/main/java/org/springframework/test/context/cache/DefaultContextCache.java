@@ -23,8 +23,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -58,10 +59,12 @@ public class DefaultContextCache implements ContextCache {
 	private static final Log statsLogger = LogFactory.getLog(CONTEXT_CACHE_LOGGING_CATEGORY);
 
 
+	ExecutorService executorService = Executors.newFixedThreadPool(8);
+
 	/**
 	 * Map of context keys to Spring {@code ApplicationContext} instances.
 	 */
-	private final Map<MergedContextConfiguration, ApplicationContext> contextMap =
+	private final Map<MergedContextConfiguration, Future<ApplicationContext>> contextMap =
 			Collections.synchronizedMap(new LruCache(32, 0.75f));
 
 	/**
@@ -124,7 +127,14 @@ public class DefaultContextCache implements ContextCache {
 	@Nullable
 	public ApplicationContext get(MergedContextConfiguration key) {
 		Assert.notNull(key, "Key must not be null");
-		ApplicationContext context = this.contextMap.get(key);
+		ApplicationContext context = null;
+		try {//FIXME [FG]
+			context = this.contextMap.get(key).get();
+		} catch (InterruptedException e) {
+			throw new RuntimeException(e);
+		} catch (ExecutionException e) {
+			throw new RuntimeException(e);
+		}
 		if (context == null) {
 			this.missCount.incrementAndGet();
 		}
@@ -134,12 +144,20 @@ public class DefaultContextCache implements ContextCache {
 		return context;
 	}
 
+
+	@Override
+	public Future<ApplicationContext> computeIfAbsent(MergedContextConfiguration key, Function<MergedContextConfiguration, ApplicationContext> mappingFunction) {
+		Assert.notNull(key, "Key must not be null");
+
+		return contextMap.computeIfAbsent(key, (k) -> executorService.submit(() -> mappingFunction.apply(k)));
+	}
+
 	@Override
 	public void put(MergedContextConfiguration key, ApplicationContext context) {
 		Assert.notNull(key, "Key must not be null");
 		Assert.notNull(context, "ApplicationContext must not be null");
 
-		this.contextMap.put(key, context);
+		this.contextMap.put(key, CompletableFuture.completedFuture(context)); //FIXME [FG]
 		MergedContextConfiguration child = key;
 		MergedContextConfiguration parent = child.getParent();
 		while (parent != null) {
@@ -199,10 +217,19 @@ public class DefaultContextCache implements ContextCache {
 
 		// Physically remove and close leaf nodes first (i.e., on the way back up the
 		// stack as opposed to prior to the recursive call).
-		ApplicationContext context = this.contextMap.remove(key);
-		if (context instanceof ConfigurableApplicationContext cac) {
-			cac.close();
+		Future<ApplicationContext> contextL = this.contextMap.remove(key);
+
+		try {
+			ApplicationContext context = contextL.get();
+			if (context instanceof ConfigurableApplicationContext cac) {
+				cac.close();
+			}
+		} catch (InterruptedException e) {
+			throw new RuntimeException(e);
+		} catch (ExecutionException e) {
+			throw new RuntimeException(e);
 		}
+
 		removedContexts.add(key);
 	}
 
@@ -304,7 +331,7 @@ public class DefaultContextCache implements ContextCache {
 	 * @since 4.3
 	 */
 	@SuppressWarnings("serial")
-	private class LruCache extends LinkedHashMap<MergedContextConfiguration, ApplicationContext> {
+	private class LruCache extends LinkedHashMap<MergedContextConfiguration, Future<ApplicationContext>> {
 
 		/**
 		 * Create a new {@code LruCache} with the supplied initial capacity
@@ -317,7 +344,7 @@ public class DefaultContextCache implements ContextCache {
 		}
 
 		@Override
-		protected boolean removeEldestEntry(Map.Entry<MergedContextConfiguration, ApplicationContext> eldest) {
+		protected boolean removeEldestEntry(Map.Entry<MergedContextConfiguration, Future<ApplicationContext>> eldest) {
 			if (this.size() > DefaultContextCache.this.getMaxSize()) {
 				// Do NOT delete "DefaultContextCache.this."; otherwise, we accidentally
 				// invoke java.util.Map.remove(Object, Object).
