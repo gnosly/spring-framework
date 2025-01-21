@@ -58,8 +58,7 @@ public class DefaultContextCache implements ContextCache {
 
 	private static final Log statsLogger = LogFactory.getLog(CONTEXT_CACHE_LOGGING_CATEGORY);
 
-
-	ExecutorService executorService = Executors.newFixedThreadPool(8);
+	ExecutorService executorService = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors()); //TODO: Make this parametric
 
 	/**
 	 * Map of context keys to Spring {@code ApplicationContext} instances.
@@ -124,24 +123,28 @@ public class DefaultContextCache implements ContextCache {
 	}
 
 	@Override
-	@Nullable
+	@Nullable //TODO: This is not used anymore in spring but make sense to keep the retro compatibility
 	public ApplicationContext get(MergedContextConfiguration key) {
 		Assert.notNull(key, "Key must not be null");
-		ApplicationContext context = null;
-		try {//FIXME [FG]
-			context = this.contextMap.get(key).get();
+
+		try {
+			Future<ApplicationContext> context = this.contextMap.get(key);
+
+			if (context == null) {
+				this.missCount.incrementAndGet();
+
+				return null;
+			}
+			else {
+				this.hitCount.incrementAndGet();
+
+				return context.get();
+			}
 		} catch (InterruptedException e) {
-			throw new RuntimeException(e);
+			throw new RuntimeException(e);//FIXME: fix the message
 		} catch (ExecutionException e) {
-			throw new RuntimeException(e);
+			throw new RuntimeException(e);//FIXME: fix the message
 		}
-		if (context == null) {
-			this.missCount.incrementAndGet();
-		}
-		else {
-			this.hitCount.incrementAndGet();
-		}
-		return context;
 	}
 
 
@@ -149,15 +152,40 @@ public class DefaultContextCache implements ContextCache {
 	public Future<ApplicationContext> computeIfAbsent(MergedContextConfiguration key, Function<MergedContextConfiguration, ApplicationContext> mappingFunction) {
 		Assert.notNull(key, "Key must not be null");
 
-		return contextMap.computeIfAbsent(key, (k) -> executorService.submit(() -> mappingFunction.apply(k)));
+		if(contextMap.containsKey(key)) {
+			this.hitCount.incrementAndGet();
+		}
+
+		return contextMap.computeIfAbsent(key, (k) ->
+				{
+					this.missCount.incrementAndGet();
+					return CompletableFuture.supplyAsync(() -> mappingFunction.apply(k), executorService)
+							.thenApply(
+									(contextLoaded) -> {
+										MergedContextConfiguration child = key;
+										MergedContextConfiguration parent = child.getParent();
+										while (parent != null) {
+											Set<MergedContextConfiguration> list = this.hierarchyMap.computeIfAbsent(parent, k2 -> new HashSet<>());
+											list.add(child);
+											child = parent;
+											parent = child.getParent();
+										}
+
+										return contextLoaded;
+									}
+							);
+
+				}
+		);
 	}
 
+	//TODO: This is not used anymore in spring but make sense to keep the retro compatibility
 	@Override
 	public void put(MergedContextConfiguration key, ApplicationContext context) {
 		Assert.notNull(key, "Key must not be null");
 		Assert.notNull(context, "ApplicationContext must not be null");
 
-		this.contextMap.put(key, CompletableFuture.completedFuture(context)); //FIXME [FG]
+		this.contextMap.put(key, CompletableFuture.completedFuture(context));
 		MergedContextConfiguration child = key;
 		MergedContextConfiguration parent = child.getParent();
 		while (parent != null) {
@@ -225,9 +253,9 @@ public class DefaultContextCache implements ContextCache {
 				cac.close();
 			}
 		} catch (InterruptedException e) {
-			throw new RuntimeException(e);
+			throw new RuntimeException(e); //FIXME: fix the message
 		} catch (ExecutionException e) {
-			throw new RuntimeException(e);
+			throw new RuntimeException(e); //FIXME: fix the message
 		}
 
 		removedContexts.add(key);

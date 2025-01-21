@@ -22,6 +22,7 @@ import java.util.concurrent.ExecutionException;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 
+import org.jetbrains.annotations.NotNull;
 import org.springframework.aot.AotDetector;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.ApplicationContextInitializer;
@@ -133,59 +134,16 @@ public class DefaultCacheAwareContextLoaderDelegate implements CacheAwareContext
 	public ApplicationContext loadContext(MergedContextConfiguration mergedConfig) {
 		mergedConfig = replaceIfNecessary(mergedConfig);
 
-		var contextLoader = this.contextCache.computeIfAbsent(mergedConfig, k -> {
-							ApplicationContext contextToReturn;
-							int failureCount = this.contextCache.getFailureCount(k);
-							if (failureCount >= this.failureThreshold) {
-								throw new IllegalStateException("""
-										ApplicationContext failure threshold (%d) exceeded: \
-										skipping repeated attempt to load context for %s"""
-										.formatted(this.failureThreshold, k));
-							}
-							try {
-								if (k instanceof AotMergedContextConfiguration aotMergedConfig) {
-									contextToReturn = loadContextInAotMode(aotMergedConfig);
-								} else {
-									contextToReturn = loadContextInternal(k);
-								}
-								if (logger.isTraceEnabled()) {
-									logger.trace("Storing ApplicationContext [%s] in cache under key %s".formatted(
-											System.identityHashCode(contextToReturn), k));
-								}
-								return contextToReturn;
-							} catch (Exception ex) {
-								if (logger.isTraceEnabled()) {
-									logger.trace("Incrementing ApplicationContext failure count for " + k);
-								}
-								this.contextCache.incrementFailureCount(k);
-								Throwable cause = ex;
-								if (ex instanceof ContextLoadException cle) {
-									cause = cle.getCause();
-									for (ApplicationContextFailureProcessor contextFailureProcessor : this.contextFailureProcessors) {
-										try {
-											contextFailureProcessor.processLoadFailure(cle.getApplicationContext(), cause);
-										} catch (Throwable throwable) {
-											if (logger.isDebugEnabled()) {
-												logger.debug("Ignoring exception thrown from ApplicationContextFailureProcessor [%s]: %s"
-														.formatted(contextFailureProcessor, throwable));
-											}
-										}
-									}
-								}
-								throw new IllegalStateException(
-										"Failed to load ApplicationContext for " + k, cause);
-							}
-						});
-
 		try {
+			var contextLoader = this.contextCache.computeIfAbsent(mergedConfig, this::loadContextForReal);
+
 			var context = contextLoader.get();
-			if (context == null) {
-			} else {
-				if (logger.isTraceEnabled()) {
-					logger.trace("Retrieved ApplicationContext [%s] from cache with key %s".formatted(
-							System.identityHashCode(context), mergedConfig));
-				}
+
+			if (context != null && logger.isTraceEnabled()) {
+				logger.trace("Retrieved ApplicationContext [%s] from cache with key %s".formatted(
+						System.identityHashCode(context), mergedConfig));
 			}
+
 			return context;
 		} catch (InterruptedException e) {
 			throw new RuntimeException(e);
@@ -193,6 +151,50 @@ public class DefaultCacheAwareContextLoaderDelegate implements CacheAwareContext
 			throw new RuntimeException(e);
 		} finally {
 			this.contextCache.logStatistics();
+		}
+	}
+
+	private @NotNull ApplicationContext loadContextForReal(MergedContextConfiguration k) {
+		int failureCount = this.contextCache.getFailureCount(k);
+		if (failureCount >= this.failureThreshold) {
+			throw new IllegalStateException("""
+					ApplicationContext failure threshold (%d) exceeded: \
+					skipping repeated attempt to load context for %s"""
+					.formatted(this.failureThreshold, k));
+		}
+		try {
+			ApplicationContext contextToReturn;
+			if (k instanceof AotMergedContextConfiguration aotMergedConfig) {
+				contextToReturn = loadContextInAotMode(aotMergedConfig);
+			} else {
+				contextToReturn = loadContextInternal(k);
+			}
+			if (logger.isTraceEnabled()) {
+				logger.trace("Storing ApplicationContext [%s] in cache under key %s".formatted(
+						System.identityHashCode(contextToReturn), k));
+			}
+			return contextToReturn;
+		} catch (Exception ex) {
+			if (logger.isTraceEnabled()) {
+				logger.trace("Incrementing ApplicationContext failure count for " + k);
+			}
+			this.contextCache.incrementFailureCount(k);
+			Throwable cause = ex;
+			if (ex instanceof ContextLoadException cle) {
+				cause = cle.getCause();
+				for (ApplicationContextFailureProcessor contextFailureProcessor : this.contextFailureProcessors) {
+					try {
+						contextFailureProcessor.processLoadFailure(cle.getApplicationContext(), cause);
+					} catch (Throwable throwable) {
+						if (logger.isDebugEnabled()) {
+							logger.debug("Ignoring exception thrown from ApplicationContextFailureProcessor [%s]: %s"
+									.formatted(contextFailureProcessor, throwable));
+						}
+					}
+				}
+			}
+			throw new IllegalStateException(
+					"Failed to load ApplicationContext for " + k, cause);
 		}
 	}
 
